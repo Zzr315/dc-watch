@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# Third-party research material. This repo may be published; these files are
+# other people's copyright and several carry explicit no-redistribution terms
+# (the J.P. Morgan note says so on its own back page). Never commit them.
+# ---------------------------------------------------------------------------
+*.pdf
+*.xls
+*.xlsx
+*.xlsm
+*.docx
+*.pptx
+摩根大通*
+*天风*
+jpm.txt
+pg[0-9][0-9].png
+fig*_zoom.png
+mlcc_ref.png
+微信图片_*.jpg
+微信图片_*.png
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local run artifacts. data/, docs/ and state/commentary.jsonl ARE committed —
+# they are the historical record the dashboard is rebuilt from.
+state/run.log
+state/brief.json
+
+# Screenshots and scratch images. Naming individual files kept letting new ones
+# through (shot_, nav_, mob_, ...), so ignore every PNG/JPG at the repo root.
+# charts/ is a subdirectory and stays tracked — that one holds deliverables.
+/*.png
+/*.jpg
+/*.jpeg
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
