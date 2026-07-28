@@ -1,0 +1,15 @@
+# Keep line endings stable in the repo regardless of who checks it out. Without
+# this, git prints a "LF will be replaced by CRLF" warning for every text file on
+# Windows and can churn diffs when the repo is touched from another platform.
+* text=auto eol=lf
+
+# Windows-only launchers genuinely want CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary — never touch, never diff
+*.png binary
+*.jpg binary
+*.gz  binary
+*.pdf binary
+*.xlsx binary
