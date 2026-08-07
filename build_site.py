@@ -1827,7 +1827,7 @@ nav a.on{background:var(--ink);color:var(--surface)}
  border:1px dashed var(--ring);border-radius:8px}
 .ph{color:var(--muted);font-size:13px;padding:34px;text-align:center;
  border:1px dashed var(--ring);border-radius:8px;letter-spacing:.04em}
-.tbl{margin-top:10px}
+.tbl{margin-top:10px;overflow-x:auto}
 .tbl summary{cursor:pointer;font-size:12px;color:var(--ink2);user-select:none}
 table{border-collapse:collapse;width:100%%;font-size:11.5px;margin-top:8px;
  font-variant-numeric:tabular-nums}
