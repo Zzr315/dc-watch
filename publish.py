@@ -80,6 +80,45 @@ def check_safe(files):
     return bad
 
 
+def push_with_tls_fallback():
+    """Push, retrying on the other TLS backend if the handshake fails.
+
+    This machine sits behind TLS interception whose state drifts: schannel has
+    failed with "failed to receive handshake" and openssl has failed with
+    "unexpected eof while reading", on different days, each time fixed by
+    switching to the other one. Unattended, a push that dies here is a single
+    log line nobody reads while the published dashboard silently goes stale, so
+    try both before giving up and leave the working backend configured.
+
+    Returns (ok, transcript_lines).
+    """
+    log = []
+    rc, cur, _ = git("config", "--get", "http.sslBackend")
+    cur = cur or "schannel"
+    order = [cur] + [b for b in ("schannel", "openssl") if b != cur]
+    for i, backend in enumerate(order):
+        if i:
+            log.append("  retrying with http.sslBackend=%s" % backend)
+            git("config", "http.sslBackend", backend)
+        rc, out, err = git("push")
+        if rc == 0:
+            if i:
+                log.append("  succeeded on %s (left configured)" % backend)
+            return True, log
+        tail = (err or out).splitlines()
+        log.append("  %s failed: %s" % (backend, tail[-1] if tail else "unknown error"))
+        # only a transport-level failure is worth swapping backends for; a
+        # rejected push (non-fast-forward, auth) will fail identically on both
+        blob = (err or out).lower()
+        if not any(s in blob for s in ("tls", "ssl", "handshake", "schannel",
+                                       "gnutls", "unable to access")):
+            break
+    # nothing worked — put the original choice back rather than leaving the
+    # repo configured for whichever backend happened to be tried last
+    git("config", "http.sslBackend", cur)
+    return False, log
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -125,12 +164,13 @@ def main():
         return 1
     print("committed: %s" % msg)
 
-    rc, out, err = git("push")
-    if rc != 0:
+    ok, log = push_with_tls_fallback()
+    for line in log:
+        print(line)
+    if not ok:
         # A failed push is not fatal — the commit is safe locally and the next
         # run will carry it. Surface the cause rather than silently succeeding.
-        print("push FAILED (commit is saved locally, will go out next run):")
-        print("  " + (err or out).splitlines()[-1] if (err or out) else "  unknown error")
+        print("push FAILED (commit is saved locally, will go out next run)")
         return 1
     rc, url, _ = git("remote", "get-url", "origin")
     print("pushed to %s" % (url or "origin"))
