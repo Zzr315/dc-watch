@@ -124,11 +124,19 @@ def _nice(lo, hi):
 
 def line_chart(cid, series, ylabel, yfmt=lambda v: "%.2f" % v,
                height=230, gap_days=2, zero_base=False, tipfmt=None,
-               end_labels=False):
+               end_labels=False, xfmt=None, annot=None):
     """series: [{'name':..., 'color_role':'s1', 'points':[(date_str, value)]}]
 
     A gap longer than gap_days starts a new subpath: a permanently missing day
-    is drawn as a break, never as a straight line across the hole."""
+    is drawn as a break, never as a straight line across the hole. Aggregated
+    series must widen gap_days past their own spacing (weekly points sit 7 days
+    apart, so the default 2 would break every single segment).
+
+    xfmt formats the x tick label; points still have to be YYYY-MM-DD because
+    the gap test parses them as dates. annot maps a date to an extra string
+    appended to that point's tooltip — for a rolled-up series it is where the
+    bucket's own total and day count go, which a value-only formatter cannot
+    carry."""
     live = [s for s in series if len(s["points"]) >= 1]
     if not live:
         return '<div class="empty">暂无数据</div>'
@@ -176,12 +184,12 @@ def line_chart(cid, series, ylabel, yfmt=lambda v: "%.2f" % v,
         if i % everyx and not is_last:
             continue
         x = px(d)
-        if last_x is not None and x - last_x < (58 if multiyear else 34):
+        if last_x is not None and x - last_x < (46 if xfmt else (58 if multiyear else 34)):
             if not is_last:
                 continue
             out.pop()          # drop the previous label in favour of the last
         out.append('<text x="%.1f" y="%d" class="tick ta-mid">%s</text>'
-                   % (x, H - 12, escape(d if multiyear else d[5:])))
+                   % (x, H - 12, escape(xfmt(d) if xfmt else (d if multiyear else d[5:]))))
         last_x = x
     out.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="axis"/>' % (ml, mt + ph, W - mr, mt + ph))
 
@@ -197,9 +205,11 @@ def line_chart(cid, series, ylabel, yfmt=lambda v: "%.2f" % v,
                    'stroke-linejoin="round" stroke-linecap="round"/>' % (" ".join(d), col))
         if not dense:
             for ds, v in pts:
+                extra = ("  ·  " + annot[ds]) if (annot and annot.get(ds)) else ""
                 out.append('<circle cx="%.1f" cy="%.1f" r="3.6" fill="%s" stroke="var(--surface)" '
                            'stroke-width="1.5" class="pt" data-tip="%s"/>'
-                           % (px(ds), py(v), col, escape("%s · %s: %s" % (ds, s["name"], tf(v)))))
+                           % (px(ds), py(v), col,
+                              escape("%s · %s: %s%s" % (ds, s["name"], tf(v), extra))))
     if dense:
         import json as _j
         payload = {"x": xs, "ml": ml, "pw": pw, "mt": mt, "ph": ph,
@@ -207,6 +217,10 @@ def line_chart(cid, series, ylabel, yfmt=lambda v: "%.2f" % v,
                           "v": [dict(sr["points"]).get(d) for d in xs],
                           "f": [tf(dict(sr["points"])[d]) if dict(sr["points"]).get(d) is not None
                                 else None for d in xs]} for sr in live]}
+        if annot:
+            # only when there is something to say — otherwise this is one empty
+            # string per x, and a 576-point daily series pays for all of them
+            payload["a"] = [annot.get(d, "") for d in xs]
         out.append('<line class="cross" x1="0" y1="%d" x2="0" y2="%d" '
                    'stroke="var(--ink)" stroke-width="1" opacity="0"/>' % (mt, mt + ph))
         out.append('<rect class="hit" x="%d" y="%d" width="%d" height="%d" fill="transparent" '
@@ -274,6 +288,74 @@ def bar_chart(cid, labels, values, ylabel, yfmt=lambda v: "%.0f" % v,
             out.append('<text x="%.1f" y="%d" class="tick ta-end rot" transform="rotate(-42 %.1f %d)">%s</text>'
                        % (cx, H - 12, cx, H - 12, escape(lb[:22])))
     out.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="axis"/>' % (ml, mt + ph, W - mr, mt + ph))
+    out.append('<text x="6" y="12" class="axlabel">%s</text>' % escape(ylabel))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def dbar_chart(cid, rows, ylabel, yfmt=lambda v: "%+.0f%%" % v, height=250,
+               pos_role="s1", neg_role="s2", label_idx=()):
+    """Diverging bars around a zero baseline. rows: [(label, value, tip)].
+
+    `bar_chart` anchors its scale at zero via _nice(0.0, hi) and clamps bar
+    height to >= 0, so a negative value there collapses to nothing. Growth rates
+    go both ways, hence a separate primitive: the zero line is the visual
+    baseline, bars grow up or down from it, and sign gets a second encoding in
+    hue so it does not rest on bar direction alone.
+
+    `label_idx` are the row indices that get a direct value label — per the
+    selective-labelling rule, not every bar carries a number."""
+    if not rows:
+        return '<div class="empty">暂无数据</div>'
+    W, H = 860, height
+    ml, mr, mt, mb = 62, 16, 30, 50
+    pw, ph = W - ml - mr, H - mt - mb
+    vals = [r[1] for r in rows]
+    lo, hi, step = _nice(min(min(vals), 0.0), max(max(vals), 0.0))
+
+    slot = pw / max(1, len(rows))
+    barw = max(2.0, min(slot - 3, 40.0))
+
+    def py(v):
+        return mt + ph - ph * (v - lo) / (hi - lo or 1)
+
+    y0 = py(0.0)
+    # label every bar only while they still fit; a daily series is 575 bars and
+    # would otherwise emit 575 overlapping rotated labels
+    everyx = 1 if len(rows) <= 20 else max(1, len(rows) // 12)
+    out = ['<svg viewBox="0 0 %d %d" class="chart" role="img">' % (W, H)]
+    t = lo
+    while t <= hi + step / 2:
+        y = py(t)
+        if abs(t) > step / 2:      # zero gets the emphasised line below instead
+            out.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="grid"/>'
+                       % (ml, y, W - mr, y))
+        out.append('<text x="%d" y="%.1f" class="tick ta-end">%s</text>'
+                   % (ml - 8, y + 3.5, escape(yfmt(t))))
+        t += step
+
+    for i, row in enumerate(rows):
+        lb, v, tip = row[0], row[1], row[2]
+        cx = ml + i * slot + slot / 2.0
+        role = pos_role if v >= 0 else neg_role
+        top = min(py(v), y0)
+        out.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="3" '
+                   'fill="var(--%s)" class="pt" data-tip="%s"/>'
+                   % (cx - barw / 2, top, barw, max(1.0, abs(py(v) - y0)), role,
+                      escape(tip)))
+        if i % everyx == 0 or i == len(rows) - 1:
+            out.append('<text x="%.1f" y="%d" class="tick ta-end rot" transform="rotate(-42 %.1f %d)">%s</text>'
+                       % (cx, H - 14, cx, H - 14, escape(lb)))
+        if i in label_idx:
+            # sit the label outside the bar's free end, and keep it inside the
+            # plot — the last bar sits flush against the right margin, so a
+            # centred label there hangs half of itself off the chart
+            ly = (py(v) - 6) if v >= 0 else (py(v) + 13)
+            lx = min(max(cx, ml + 14), W - mr - 14)
+            out.append('<text x="%.1f" y="%.1f" class="tick ta-mid">%s</text>'
+                       % (lx, ly, escape(yfmt(v))))
+    out.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="axis"/>'
+               % (ml, y0, W - mr, y0))
     out.append('<text x="6" y="12" class="axlabel">%s</text>' % escape(ylabel))
     out.append("</svg>")
     return "".join(out)
@@ -552,6 +634,83 @@ def assemble(items):
     return nav, "".join(body)
 
 
+def periodise(daily, keys, freq, min_days):
+    """Roll a daily series up to weekly/monthly buckets.
+
+    Returns [(bucket_date, {key: mean_daily}, {key: total}, n_days)] sorted by
+    date, dropping buckets thinner than min_days.
+
+    Every frequency reports MEAN DAILY volume, not the bucket's sum, and the
+    y axis unit is therefore identical across all three views — switching
+    frequency is pure smoothing, the level never jumps 7x or 30x. That is not
+    just cosmetic; a sum-based rollup carries three artefacts this avoids:
+
+      * calendar length — Feb vs Mar is +10.7% on day count alone
+      * partial edge buckets — the current week/month is always mid-flight, so
+        its sum dips and reads as a collapse
+      * the two upstream holes (2025-06-15, 2025-07-15) would each shave ~1/7
+        off their week
+
+    The bucket total is still carried through for the tooltip, so "how much in
+    total this week" stays one hover away.
+    """
+    buckets = {}
+    for r in daily:
+        d = dparse(sdate(r))
+        if freq == "w":
+            k = (d - dt.timedelta(days=d.weekday())).isoformat()   # ISO Monday
+        elif freq == "m":
+            k = "%04d-%02d-01" % (d.year, d.month)
+        else:
+            k = d.isoformat()
+        b = buckets.setdefault(k, {"n": 0, "sum": {}})
+        # count a day once, even if two keys land on it
+        b["n"] += 1
+        for key in keys:
+            v = num(r.get(key))
+            if v is not None:
+                b["sum"][key] = b["sum"].get(key, 0.0) + v
+    out = []
+    for k in sorted(buckets):
+        b = buckets[k]
+        if b["n"] < min_days:
+            continue
+        means = {key: (b["sum"][key] / b["n"]) for key in b["sum"]}
+        out.append((k, means, dict(b["sum"]), b["n"]))
+    return out
+
+
+def growth_of(buck, freq, key="total_tokens"):
+    """Period-over-period growth (环比) from periodise() output.
+
+    Emits a value only when the previous bucket is the IMMEDIATELY preceding
+    period. Holes exist — 2025-06-15 is missing upstream, and thin edge buckets
+    get dropped — and comparing across one silently produces a two-period change
+    labelled as one period's 环比: the arithmetic is fine and the label is a lie.
+    Skipping leaves a genuine gap instead.
+
+    Returns [(bucket_date, pct, mean, n_days, prev_date)].
+    """
+    out = []
+    for i in range(1, len(buck)):
+        k, m, _t, n = buck[i]
+        pk, pm = buck[i - 1][0], buck[i - 1][1]
+        prev, cur = pm.get(key), m.get(key)
+        if not prev or cur is None:
+            continue
+        d0, d1 = dparse(pk), dparse(k)
+        if freq == "d":
+            adj = (d1 - d0).days == 1
+        elif freq == "w":
+            adj = (d1 - d0).days == 7
+        else:
+            adj = (d1.year * 12 + d1.month) - (d0.year * 12 + d0.month) == 1
+        if not adj:
+            continue
+        out.append((k, (cur / prev - 1.0) * 100.0, cur, n, pk))
+    return out
+
+
 def spec(scope=None, calc=None, src=None, warn=None):
     """The three questions every panel has to answer before its numbers mean
     anything: what is being counted, how it was computed, and where it came
@@ -569,11 +728,15 @@ def spec(scope=None, calc=None, src=None, warn=None):
     return grid + w
 
 
-def panel(title, subtitle, svg, table_html=None, note=None, pid="", meta=""):
+def panel(title, subtitle, svg, table_html=None, note=None, pid="", meta="",
+          extra=""):
+    """`note` is inserted as raw HTML, not escaped — it is where a panel puts
+    per-frequency copy that has to toggle with the charts. `extra` goes on the
+    section tag itself (a data-freqgroup, say)."""
     t = ('<details class="tbl"><summary>数据表</summary>%s</details>' % table_html) if table_html else ""
     n = ('<p class="note">%s</p>' % note) if note else ""
-    return ('<section class="panel" id="%s"><h2>%s</h2><p class="sub">%s</p>%s%s%s%s</section>'
-            % (pid, escape(title), escape(subtitle), svg, meta, n, t))
+    return ('<section class="panel" id="%s"%s><h2>%s</h2><p class="sub">%s</p>%s%s%s%s</section>'
+            % (pid, extra, escape(title), escape(subtitle), svg, meta, n, t))
 
 
 # -------------------------------------------------------------------- data
@@ -832,30 +995,201 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
     if len(daily) > 30:
         dm = ((brief.get("llm") or {}).get("daily") or {}).get("metrics") or {}
         tt = dm.get("total_tokens") or {}
-        ser = [{"name": "全部模型", "color_role": "s1",
-                "points": [(sdate(r), num(r.get("total_tokens"))) for r in daily
-                           if num(r.get("total_tokens")) is not None]},
-               {"name": "美国模型", "color_role": "s2",
-                "points": [(sdate(r), num(r.get("us_tokens"))) for r in daily
-                           if num(r.get("us_tokens")) is not None]}]
         first, last = sdate(daily[0]), sdate(daily[-1])
+
+        # Three frequencies, all pre-rendered server-side and toggled by CSS.
+        # Aggregating in the browser instead would mean reimplementing the
+        # bucketing and rebuilding each chart's crosshair payload in JS; the
+        # crosshair reads getBoundingClientRect() at event time, so a hidden
+        # SVG needs no special handling and simply never fires.
+        KEYS = ["total_tokens", "us_tokens"]
+        NAMES = [("total_tokens", "全部模型", "s1"), ("us_tokens", "美国模型", "s2")]
+        # min_days guards partial edge buckets: below it, weekday composition
+        # alone drives the mean (a month that has only run to a Saturday reads
+        # structurally light), so the point would be noise dressed as a level.
+        # Both panels share these thresholds — now that they toggle together,
+        # showing different period sets in each would be indefensible.
+        FREQ = [("d", "日频", "日", 1, 2, None, 7),
+                ("w", "周频", "周", 4, 9, None, 4),
+                ("m", "月频", "月", 15, 40, lambda s: s[:7], 3)]
+        lv_charts, lv_tables, lv_notes = [], [], []
+        gr_charts, gr_tables, gr_notes = [], [], []
+        counts = {}
+        for code, flabel, ulabel, min_days, gapd, xf, win in FREQ:
+            buck = periodise(daily, KEYS, code, min_days)
+            counts[code] = len(buck)
+            if not buck:
+                continue
+            unit = {"d": "当日", "w": "本周", "m": "本月"}[code]
+
+            # ---- level chart
+            ser = []
+            for key, nm, role in NAMES:
+                pts = [(k, m[key]) for k, m, _t, _n in buck if key in m]
+                ser.append({"name": nm, "color_role": role, "points": pts})
+            # the mean-based axis cannot show "how much in total this week", and
+            # a value-only tipfmt cannot either, so the bucket total and day
+            # count ride along as a per-point annotation. It has to name 全站
+            # explicitly: the annotation is shared by both series' tooltips, so
+            # on the 美国模型 marker an unlabelled "本月合计" would read as that
+            # series' own total when it is the site-wide one.
+            ann = None
+            if code != "d":
+                ann = {}
+                for k, _m, t, n in buck:
+                    tot = t.get("total_tokens")
+                    if tot is not None:
+                        ann[k] = "全站%s合计 %.2fT · %d 天" % (unit, tot / 1e12, n)
+            lv_charts.append((code, flabel, line_chart(
+                "hist_" + code, ser, "日均 tokens",
+                lambda v: "%.0fT" % (v / 1e12), height=250, zero_base=True,
+                gap_days=gapd, xfmt=xf, annot=ann,
+                tipfmt=lambda v: "%.3fT/日" % (v / 1e12))))
+
+            hdr = {"d": "日期", "w": "周(周一)", "m": "月份"}[code]
+            if code == "d":
+                # for a daily bucket the mean IS the day and n is always 1, so
+                # those two columns would just repeat themselves
+                lv_tables.append((code, table_of(
+                    [hdr, "全部 (T)", "美国 (T)"],
+                    [[k, "%.3f" % ((m.get("total_tokens") or 0) / 1e12),
+                      "%.3f" % ((m.get("us_tokens") or 0) / 1e12)]
+                     for k, m, _t, _n in reversed(buck[-40:])])))
+            else:
+                lv_tables.append((code, table_of(
+                    [hdr, "全部 日均(T)", "美国 日均(T)", "%s合计(T)" % unit, "天数"],
+                    [[k[:7] if code == "m" else k,
+                      "%.3f" % ((m.get("total_tokens") or 0) / 1e12),
+                      "%.3f" % ((m.get("us_tokens") or 0) / 1e12),
+                      "%.2f" % ((t.get("total_tokens") or 0) / 1e12), "%d" % n]
+                     for k, m, t, n in reversed(buck[-40:])])))
+            lv_notes.append((code, {
+                "d": "日频保留全部噪声，图中锯齿是周末效应（周末用量结构性低于工作日），不是数据问题。",
+                "w": "按 ISO 周（周一至周日）归集，周末效应被周内平均吸收。",
+                "m": "按自然月归集，最平滑，适合读趋势。",
+            }[code]))
+
+            # ---- growth chart, same buckets
+            gr = growth_of(buck, code)
+            if len(gr) < 3:
+                continue
+            gv = [g[1] for g in gr]
+            # at daily frequency the day count is always 1 and the comparison
+            # period is always yesterday, so spelling both out 575 times is
+            # ~25KB of the page saying nothing
+            if code == "d":
+                rows_g = [(k[2:], g, "%s · 环比 %+.1f%% · %.3fT" % (k, g, mean / 1e12))
+                          for k, g, mean, _n, _pk in gr]
+            else:
+                rows_g = [(k[2:] if code == "w" else k[2:7], g,
+                           "%s · 环比 %+.1f%% · 日均 %.3fT · %d 天 · 对比 %s"
+                           % (k, g, mean / 1e12, n, pk))
+                          for k, g, mean, n, pk in gr]
+            imax, imin = gv.index(max(gv)), gv.index(min(gv))
+            gr_charts.append((code, flabel, dbar_chart(
+                "growth_" + code, rows_g, "环比 %",
+                yfmt=lambda v: "%+.0f%%" % v,
+                label_idx={imax, imin, len(rows_g) - 1})))
+            gr_tables.append((code, table_of(
+                [hdr, "日均 (T)", "天数", "环比", "对比期"],
+                [[k[:7] if code == "m" else k, "%.3f" % (mean / 1e12),
+                  "%d" % n, "%+.1f%%" % g, pk[:7] if code == "m" else pk]
+                 for k, g, mean, n, pk in reversed(gr)])))
+
+            # Summarising a rate is where this goes wrong quietly. The arithmetic
+            # mean of period-over-period percentages is biased upward when the
+            # series is volatile, and averaging across weekday boundaries is
+            # meaningless anyway: at daily frequency it returned ~-0.1%/day
+            # (about -3%/month) for a month the monthly view scores at +27.6%.
+            # Both cannot describe the same series.
+            #
+            # So compare LEVELS over three equal windows instead — no averaging
+            # of returns, and at daily frequency a 7-day window cancels the
+            # weekday effect by construction.
+            lv = [x[1].get("total_tokens") for x in buck]   # bucket means, chronological
+            summ = ""
+            if len(lv) >= 3 * win and all(v is not None for v in lv[-3 * win:]):
+                def wmean(a, b):
+                    seg = lv[a:b] if b else lv[a:]
+                    return (sum(seg) / len(seg)) if seg else None
+                A, B, C = wmean(-win, None), wmean(-2 * win, -win), wmean(-3 * win, -2 * win)
+                if A and B and C:
+                    g1, g0 = (A / B - 1.0) * 100.0, (B / C - 1.0) * 100.0
+                    # "增速抬升" on -2.1% against -6.0% reads as growing faster
+                    # when the series is in fact shrinking less, so the verdict
+                    # has to know about signs
+                    if g1 >= 0 and g0 >= 0:
+                        verdict = "增速抬升" if g1 > g0 else "增速放缓"
+                    elif g1 < 0 and g0 < 0:
+                        verdict = "跌幅收窄" if g1 > g0 else "跌幅扩大"
+                    else:
+                        verdict = "由跌转涨" if g1 >= 0 else "由涨转跌"
+                    summ = ("近 %d%s vs 前 %d%s %+.1f%%，上一段 %+.1f%%（%s）　"
+                            % (win, ulabel, win, ulabel, g1, g0, verdict))
+            skipped = len(buck) - 1 - len(gr)
+            gr_notes.append((code, "%s共 %d 个%s环比观测%s%s" % (
+                summ, len(gr), ulabel,
+                ("，%d 处因相邻期缺失未计算" % skipped) if skipped else "",
+                "。日环比被周内构成主导（周六对周五天然是负的），"
+                "极值基本是星期几造成的，不要当成事件。" if code == "d" else "。")))
+
+        def freqbar(note):
+            return ('<div class="freqbar" role="group" aria-label="频率口径">'
+                    + "".join('<button type="button" class="fq%s" data-set="%s">%s</button>'
+                              % (" on" if c == "d" else "", c, lb)
+                              for c, lb, _s in lv_charts)
+                    + '<span class="fqnote">%s</span></div>' % escape(note))
+
+        def views(items):
+            return "".join('<div data-freq="%s"%s>%s</div>'
+                           % (c, "" if c == "d" else " hidden", body)
+                           for c, body in items)
+
+        # a growth multiple off two single days is hostage to which weekday each
+        # landed on; take it off the monthly means instead
+        mb = periodise(daily, ["total_tokens"], "m", 15)
         mult = ""
-        f0 = num(daily[0].get("total_tokens")) or 0
-        l0 = num(daily[-1].get("total_tokens")) or 0
-        if f0:
-            mult = "　起点至今 %.0f 倍" % (l0 / f0)
+        if len(mb) >= 2:
+            f0 = mb[0][1].get("total_tokens") or 0
+            l0 = mb[-1][1].get("total_tokens") or 0
+            if f0:
+                mult = ("　月日均 %s→%s 涨 %.0f 倍"
+                        % (mb[0][0][:7], mb[-1][0][:7], l0 / f0))
+
+        GROUP = ' data-freqgroup="tokens"'
         H.append(panel(
-            "日频用量长历史", "%s 至 %s，共 %d 个观测%s" % (first, last, len(daily), mult),
-            line_chart("hist", ser, "tokens/日", lambda v: "%.0fT" % (v / 1e12),
-                       height=250, zero_base=True,
-                       tipfmt=lambda v: "%.3fT" % (v / 1e12)),
+            "Token 用量历史（D/W/M）",
+            "%s 至 %s · 日 %d / 周 %d / 月 %d 个观测%s"
+            % (first, last, counts.get("d", 0), counts.get("w", 0),
+               counts.get("m", 0), mult),
+            freqbar("三种频率同为「日均 token 量」，纵轴同一单位，切换只改变平滑程度，"
+                    "不改变量级；下方增速面板同步切换")
+            + views([(c, s) for c, _lb, s in lv_charts]),
+            # frequency-independent, so it stays put rather than toggling away
             table_of(["指标", "日环比", "周环比", "月环比", "同比"],
                      [["日 Token 量", fmt_pct(tt.get("dod")), fmt_pct(tt.get("wow")),
-                       fmt_pct(tt.get("mom")), fmt_pct(tt.get("yoy"))]]),
-            pid="history",
-            meta=spec(scope=u"每个自然日的全站 token 总量（不是滚动窗口）。回补区间 2025-01-01 起共 571 天。", calc=u"接口每日返回用量前 50 的模型，外加一行 other 汇总其余全部模型，两者相加即当日完整总量，因此不是「只统计头部」。", src=u"OpenRouter 官方数据集 v1/datasets/rankings-daily，一次性回补，此后由日常采集接续。", warn=u"只有「量」能回补——OpenRouter 不提供历史价格，所以价格/支出/VWAP 只能从本看板首次运行起累积，本面板故意不画这三条。图中 2 处断点（2025-06-15、2025-07-15）是上游数据集本身的空洞。")))
+                       fmt_pct(tt.get("mom")), fmt_pct(tt.get("yoy"))]])
+            + views(lv_tables),
+            note=views(lv_notes),
+            pid="history", extra=GROUP,
+            meta=spec(scope=u"每个自然日的全站 token 总量（不是滚动窗口），回补区间 2025-01-01 起。周频按 ISO 周（周一至周日）归集，月频按自然月归集。「美国模型」指 OpenAI / Anthropic / Google / xAI / Meta / Microsoft / Nvidia / Amazon 八家。", calc=u"接口每日返回用量前 50 的模型，外加一行 other 汇总其余全部模型，两者相加即当日完整总量，因此不是「只统计头部」。周频/月频取该桶内各日总量的算术平均即「日均」，而非桶内合计——合计口径会混入三种假信号：自然月天数差异（2 月→3 月仅凭 31/28 就多出 10.7%）、边缘桶未走完（当周/当月总是进行中，合计会塌陷成假暴跌）、以及 2 处缺日各让所在周少掉约 1/7。桶内合计仍在 tooltip 和数据表里给出。", src=u"OpenRouter 官方数据集 v1/datasets/rankings-daily，一次性回补，此后由日常采集接续。", warn=u"周频要求桶内至少 4 天、月频至少 15 天，不足则该桶不画（当周/当月刚开始时，日均会被周内构成主导）。所以最右端可能比日频少一个点，这是有意的。只有「量」能回补——OpenRouter 不提供历史价格，所以价格/支出/VWAP 只能从本看板首次运行起累积，本面板故意不画这三条。日频图中 2 处断点（2025-06-15、2025-07-15）是上游数据集本身的空洞，周频月频下它们被日均口径吸收，不再显示为断点。")))
         H.append('<div class="legend"><span class="sw s1"></span>全部模型'
-                 '<span class="sw s2"></span>美国模型</div>')
+                 '<span class="sw s2"></span>美国模型'
+                 '<span class="lgnote">纵轴＝日均 tokens，三频率同单位</span></div>')
+
+        if gr_charts:
+            H.append(panel(
+                "Token 用量环比增速（D/W/M）",
+                "与上方用量历史同频联动 · 任一处切换，两图一起变",
+                freqbar("环比＝本期日均 ÷ 上期日均 − 1；柱高是增速不是量级")
+                + views([(c, s) for c, _lb, s in gr_charts]),
+                views(gr_tables),
+                note=views(gr_notes),
+                pid="momgrowth", extra=GROUP,
+                meta=spec(scope=u"上方面板同一批分桶的环比增速，频率随上方联动。日频＝逐日对前一日，周频＝逐周对上周，月频＝逐月对上月。", calc=u"每期先取该期「日均 token 量」＝桶内各日总量的算术平均，再算相邻两期日均之比减一。用日均而非桶内合计是必要的：合计口径的环比会混入自然月天数差异（2 月→3 月仅凭 31/28 就凭空多出 10.7%）与边缘桶未走完的假暴跌。只有当上一期是紧邻的前一期时才计算——跨过数据空洞去比，会得到一个算术正确但标签撒谎的「环比」，那种点直接跳过，留成真实的缺口。", src=u"与上方面板同源，OpenRouter v1/datasets/rankings-daily 回补 + 日常采集接续，不引入任何新数据源。", warn=u"频率越细，噪声越大：日环比几乎完全由星期几决定（周六对周五天然为负），读它的极值没有意义，看周频月频才是趋势。柱高是增速不是量级——增速回落只说明扩张变慢，不代表用量下降，用量本身见上方面板。")))
+            H.append('<div class="legend"><span class="sw s1"></span>环比正增长'
+                     '<span class="sw s2"></span>环比负增长'
+                     '<span class="lgnote">柱高＝本期日均相对上期的变化幅度</span></div>')
 
     # ---------------- vendor share, the one series with a year already in it
     ms = brief.get("market_share") or {}
@@ -1477,6 +1811,16 @@ nav a.on{background:var(--ink);color:var(--surface)}
 .sw.s4{background:var(--s4)}.sw.s5{background:var(--s5)}.sw.s6{background:var(--s6)}
 .sw.s7{background:var(--s7)}.sw.s8{background:var(--s8)}
 .endlab{font-size:9.5px;font-weight:640}
+.lgnote{color:var(--muted);margin-left:14px}
+[hidden]{display:none!important}
+.freqbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+ margin:0 0 8px;padding-left:18px}
+.fq{font:inherit;font-size:12px;line-height:1;cursor:pointer;
+ padding:5px 11px;border-radius:6px;color:var(--ink2);
+ background:var(--plane);border:1px solid var(--grid)}
+.fq:hover{color:var(--ink);border-color:var(--baseline)}
+.fq.on{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600}
+.fqnote{font-size:11.5px;color:var(--muted);margin-left:8px}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media(max-width:720px){.two{grid-template-columns:1fr}}
 .empty{color:var(--muted);font-size:12.5px;padding:22px;text-align:center;
@@ -1524,6 +1868,7 @@ document.querySelectorAll('rect.hit').forEach(function(hit){
     cross.setAttribute('x1',cx); cross.setAttribute('x2',cx); cross.setAttribute('opacity','0.45');
     var lines=[d.x[i]];
     d.s.forEach(function(sr){ if(sr.f[i]!=null) lines.push(sr.n+': '+sr.f[i]); });
+    if(d.a&&d.a[i]) lines.push(d.a[i]);
     tip.textContent=lines.join('  ·  '); tip.style.opacity=1;
     var x=ev.clientX+13,y=ev.clientY+13,tb=tip.getBoundingClientRect();
     if(x+tb.width>innerWidth)x=ev.clientX-tb.width-13;
@@ -1562,6 +1907,43 @@ document.querySelectorAll('.block').forEach(function(b){
   addEventListener('scroll',function(){if(!raf)raf=requestAnimationFrame(pick);},{passive:true});
   addEventListener('resize',function(){if(!raf)raf=requestAnimationFrame(pick);});
   pick();
+})();
+/* frequency toggle. Panels sharing a data-freqgroup switch together, so the
+   level chart and its growth chart are never showing different frequencies —
+   which would be worse than no toggle at all. Every bar in the group stays in
+   sync, so either panel can drive. */
+(function(){
+  var groups={};
+  document.querySelectorAll('[data-freqgroup]').forEach(function(el){
+    var g=el.getAttribute('data-freqgroup');
+    (groups[g]=groups[g]||[]).push(el);
+  });
+  Object.keys(groups).forEach(function(g){
+    var bars=[],views=[];
+    groups[g].forEach(function(r){
+      [].push.apply(bars,r.querySelectorAll('.freqbar'));
+      [].push.apply(views,r.querySelectorAll('[data-freq]'));
+    });
+    if(!bars.length||!views.length)return;
+    var key='dcw-freq-'+g;
+    var valid={};
+    bars.forEach(function(b){b.querySelectorAll('.fq').forEach(function(btn){
+      valid[btn.getAttribute('data-set')]=1;});});
+    function apply(v){
+      if(!valid[v])return false;
+      bars.forEach(function(b){b.querySelectorAll('.fq').forEach(function(btn){
+        var on=btn.getAttribute('data-set')===v;
+        btn.classList.toggle('on',on);
+        btn.setAttribute('aria-pressed',on?'true':'false');});});
+      views.forEach(function(e){e.hidden=e.getAttribute('data-freq')!==v;});
+      try{localStorage.setItem(key,v)}catch(_){}
+      return true;
+    }
+    bars.forEach(function(b){b.addEventListener('click',function(e){
+      var btn=e.target.closest('.fq'); if(btn)apply(btn.getAttribute('data-set'));});});
+    var sv=null; try{sv=localStorage.getItem(key)}catch(_){}
+    if(!(sv&&apply(sv)))apply('d');
+  });
 })();
 var btn=document.getElementById('tt');
 function cur(){var s=document.documentElement.getAttribute('data-theme');
