@@ -124,7 +124,7 @@ def _nice(lo, hi):
 
 def line_chart(cid, series, ylabel, yfmt=lambda v: "%.2f" % v,
                height=230, gap_days=2, zero_base=False, tipfmt=None,
-               end_labels=False, xfmt=None, annot=None):
+               end_labels=False, xfmt=None, annot=None, dashed_from=None):
     """series: [{'name':..., 'color_role':'s1', 'points':[(date_str, value)]}]
 
     A gap longer than gap_days starts a new subpath: a permanently missing day
@@ -196,19 +196,38 @@ def line_chart(cid, series, ylabel, yfmt=lambda v: "%.2f" % v,
     for s in live:
         col = "var(--%s)" % s["color_role"]
         pts = sorted([p for p in s["points"] if p[1] is not None], key=lambda p: p[0])
-        d, prev = [], None
-        for ds, v in pts:
-            cmd = "M" if (prev is None or (dparse(ds) - dparse(prev)).days > gap_days) else "L"
-            d.append("%s%.1f %.1f" % (cmd, px(ds), py(v)))
-            prev = ds
-        out.append('<path d="%s" fill="none" stroke="%s" stroke-width="2" '
-                   'stroke-linejoin="round" stroke-linecap="round"/>' % (" ".join(d), col))
+        # A trailing partial bucket is a real number but not a comparable one —
+        # its mean is whatever weekdays happen to have landed in it so far. Draw
+        # that last leg dashed so it never reads as another settled point.
+        cut = None
+        if dashed_from:
+            for idx, (ds, _v) in enumerate(pts):
+                if ds >= dashed_from:
+                    cut = idx
+                    break
+        segs = [(pts, False)] if cut is None else [(pts[:cut + 1], False),
+                                                   (pts[max(0, cut - 1):], True)]
+        for seg, dash in segs:
+            if len(seg) < 1:
+                continue
+            d, prev = [], None
+            for ds, v in seg:
+                cmd = "M" if (prev is None or (dparse(ds) - dparse(prev)).days > gap_days) else "L"
+                d.append("%s%.1f %.1f" % (cmd, px(ds), py(v)))
+                prev = ds
+            out.append('<path d="%s" fill="none" stroke="%s" stroke-width="2" '
+                       'stroke-linejoin="round" stroke-linecap="round"%s/>'
+                       % (" ".join(d), col,
+                          ' stroke-dasharray="5 3" opacity="0.75"' if dash else ""))
         if not dense:
             for ds, v in pts:
                 extra = ("  ·  " + annot[ds]) if (annot and annot.get(ds)) else ""
-                out.append('<circle cx="%.1f" cy="%.1f" r="3.6" fill="%s" stroke="var(--surface)" '
+                hollow = dashed_from and ds >= dashed_from
+                out.append('<circle cx="%.1f" cy="%.1f" r="3.6" fill="%s" stroke="%s" '
                            'stroke-width="1.5" class="pt" data-tip="%s"/>'
-                           % (px(ds), py(v), col,
+                           % (px(ds), py(v),
+                              "var(--surface)" if hollow else col,
+                              col if hollow else "var(--surface)",
                               escape("%s · %s: %s%s" % (ds, s["name"], tf(v), extra))))
     if dense:
         import json as _j
@@ -294,7 +313,7 @@ def bar_chart(cid, labels, values, ylabel, yfmt=lambda v: "%.0f" % v,
 
 
 def dbar_chart(cid, rows, ylabel, yfmt=lambda v: "%+.0f%%" % v, height=250,
-               pos_role="s1", neg_role="s2", label_idx=()):
+               pos_role="s1", neg_role="s2", label_idx=(), partial_idx=()):
     """Diverging bars around a zero baseline. rows: [(label, value, tip)].
 
     `bar_chart` anchors its scale at zero via _nice(0.0, hi) and clamps bar
@@ -339,9 +358,15 @@ def dbar_chart(cid, rows, ylabel, yfmt=lambda v: "%+.0f%%" % v, height=250,
         cx = ml + i * slot + slot / 2.0
         role = pos_role if v >= 0 else neg_role
         top = min(py(v), y0)
+        # A period still running is measured on a like-for-like subset of days,
+        # which makes it comparable but not settled — hollow it out so it never
+        # sits in the row looking like a closed period.
+        prov = i in partial_idx
         out.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="3" '
-                   'fill="var(--%s)" class="pt" data-tip="%s"/>'
+                   'fill="var(--%s)"%s class="pt" data-tip="%s"/>'
                    % (cx - barw / 2, top, barw, max(1.0, abs(py(v) - y0)), role,
+                      (' fill-opacity="0.34" stroke="var(--%s)" stroke-width="1.5"' % role)
+                      if prov else "",
                       escape(tip)))
         if i % everyx == 0 or i == len(rows) - 1:
             out.append('<text x="%.1f" y="%d" class="tick ta-end rot" transform="rotate(-42 %.1f %d)">%s</text>'
@@ -634,11 +659,28 @@ def assemble(items):
     return nav, "".join(body)
 
 
-def periodise(daily, keys, freq, min_days):
+def _days_in_month(y, m):
+    nxt = dt.date(y + (1 if m == 12 else 0), (m % 12) + 1, 1)
+    return (nxt - dt.date(y, m, 1)).days
+
+
+def periodise(daily, keys, freq):
     """Roll a daily series up to weekly/monthly buckets.
 
-    Returns [(bucket_date, {key: mean_daily}, {key: total}, n_days)] sorted by
-    date, dropping buckets thinner than min_days.
+    Returns a list of bucket dicts, oldest first:
+        key     bucket start date (ISO Monday for weeks, the 1st for months)
+        means   {key: mean daily value}
+        totals  {key: sum over the bucket}
+        n       days actually observed
+        full    True once the period has ENDED. Deliberately not "no missing
+                days": 2025-06 is short one day (an upstream hole on the 15th)
+                yet it closed long ago, and its plain mean is the right answer.
+                What needs special handling is a period still in flight, whose
+                absent days are all at the end and therefore all the same
+                weekdays — that is where the mean skews.
+        slots   {slot: {key: value}} — slot locates a day WITHIN its bucket
+                (weekday 0-6 for weeks, day-of-month for months). This is what
+                makes a like-for-like comparison of a running bucket possible.
 
     Every frequency reports MEAN DAILY volume, not the bucket's sum, and the
     y axis unit is therefore identical across all three views — switching
@@ -651,63 +693,118 @@ def periodise(daily, keys, freq, min_days):
       * the two upstream holes (2025-06-15, 2025-07-15) would each shave ~1/7
         off their week
 
-    The bucket total is still carried through for the tooltip, so "how much in
-    total this week" stays one hover away.
+    Nothing is dropped for being thin. A running bucket's MEAN is still skewed
+    by which weekdays happen to be in it so far, so callers must not compare it
+    to a settled one directly — growth_of() handles that, and the level chart
+    marks it.
     """
     buckets = {}
+    seen = []
     for r in daily:
         d = dparse(sdate(r))
+        seen.append(d)
         if freq == "w":
-            k = (d - dt.timedelta(days=d.weekday())).isoformat()   # ISO Monday
+            k = (d - dt.timedelta(days=d.weekday())).isoformat()
+            slot = d.weekday()
+            end = d + dt.timedelta(days=6 - d.weekday())
         elif freq == "m":
             k = "%04d-%02d-01" % (d.year, d.month)
+            slot = d.day
+            end = dt.date(d.year, d.month, _days_in_month(d.year, d.month))
         else:
             k = d.isoformat()
-        b = buckets.setdefault(k, {"n": 0, "sum": {}})
-        # count a day once, even if two keys land on it
+            slot, end = 0, d
+        b = buckets.setdefault(k, {"n": 0, "sum": {}, "slots": {}, "end": end})
+        if slot in b["slots"]:          # same day twice: last wins, no double count
+            b["n"] -= 1
         b["n"] += 1
+        cell = b["slots"].setdefault(slot, {})
         for key in keys:
             v = num(r.get(key))
             if v is not None:
+                cell[key] = v
+        b["sum"] = {}
+        for s in b["slots"].values():
+            for key, v in s.items():
                 b["sum"][key] = b["sum"].get(key, 0.0) + v
+    if not seen:
+        return []
+    horizon = max(seen)
     out = []
     for k in sorted(buckets):
         b = buckets[k]
-        if b["n"] < min_days:
-            continue
-        means = {key: (b["sum"][key] / b["n"]) for key in b["sum"]}
-        out.append((k, means, dict(b["sum"]), b["n"]))
+        out.append({"key": k,
+                    "means": {key: b["sum"][key] / b["n"] for key in b["sum"]},
+                    "totals": dict(b["sum"]),
+                    "n": b["n"],
+                    "full": b["end"] <= horizon,
+                    "slots": b["slots"]})
     return out
 
 
-def growth_of(buck, freq, key="total_tokens"):
+def _adjacent(prev_key, cur_key, freq):
+    a, b = dparse(prev_key), dparse(cur_key)
+    if freq == "d":
+        return (b - a).days == 1
+    if freq == "w":
+        return (b - a).days == 7
+    return (b.year * 12 + b.month) - (a.year * 12 + a.month) == 1
+
+
+
+def growth_of(buckets, freq, key="total_tokens"):
     """Period-over-period growth (环比) from periodise() output.
 
-    Emits a value only when the previous bucket is the IMMEDIATELY preceding
-    period. Holes exist — 2025-06-15 is missing upstream, and thin edge buckets
-    get dropped — and comparing across one silently produces a two-period change
-    labelled as one period's 环比: the arithmetic is fine and the label is a lie.
-    Skipping leaves a genuine gap instead.
+    Two rules, and the second is the reason this function exists.
 
-    Returns [(bucket_date, pct, mean, n_days, prev_date)].
+    1. Only compare against the IMMEDIATELY preceding period. Holes exist —
+       2025-06-15 is missing upstream — and comparing across one silently
+       produces a two-period change labelled as one period's 环比: the
+       arithmetic is fine and the label is a lie. Skipping leaves a real gap.
+
+    2. When either side is still running, compare only the day slots present in
+       BOTH — but for WEEKS only. A week is exactly seven days and its slot IS
+       the weekday, so intersecting slots aligns Monday with Monday and the
+       weekday mix cancels: on 2026-08-31 that turned a +4.5% weekday-mix
+       artefact into the real +1.5%.
+
+       Months get no such treatment and a running month is skipped outright.
+       Month length is not a multiple of seven, so "same day-of-month" aligns
+       nothing that matters: 2026-09-01..05 is Tue–Sat while 2026-08-01..05 is
+       Sat–Wed, and comparing them scored +96.4% largely by matching weekdays
+       against weekend days. A number that wrong is worse than a missing bar.
+
+    Two settled buckets always compare plain means, so every historical value
+    is exactly what it was. "Settled" means the period has ended — not that
+    every day is present: 2025-06 is short an upstream day yet closed long ago,
+    and its ordinary mean remains the right answer.
+
+    Returns dicts: key, pct, mean, n, prev_key, partial, basis (slots compared).
     """
     out = []
-    for i in range(1, len(buck)):
-        k, m, _t, n = buck[i]
-        pk, pm = buck[i - 1][0], buck[i - 1][1]
-        prev, cur = pm.get(key), m.get(key)
-        if not prev or cur is None:
+    for i in range(1, len(buckets)):
+        cur, prev = buckets[i], buckets[i - 1]
+        if not _adjacent(prev["key"], cur["key"], freq):
             continue
-        d0, d1 = dparse(pk), dparse(k)
-        if freq == "d":
-            adj = (d1 - d0).days == 1
-        elif freq == "w":
-            adj = (d1 - d0).days == 7
+        if cur["full"] and prev["full"]:
+            a, b = cur["means"].get(key), prev["means"].get(key)
+            basis, partial = cur["n"], False
+        elif freq != "w":
+            continue
         else:
-            adj = (d1.year * 12 + d1.month) - (d0.year * 12 + d0.month) == 1
-        if not adj:
+            shared = sorted(s for s in cur["slots"]
+                            if s in prev["slots"]
+                            and key in cur["slots"][s] and key in prev["slots"][s])
+            if not shared:
+                continue
+            a = sum(cur["slots"][s][key] for s in shared) / len(shared)
+            b = sum(prev["slots"][s][key] for s in shared) / len(shared)
+            basis, partial = len(shared), True
+        if a is None or not b:
             continue
-        out.append((k, (cur / prev - 1.0) * 100.0, cur, n, pk))
+        out.append({"key": cur["key"], "pct": (a / b - 1.0) * 100.0,
+                    "mean": cur["means"].get(key), "n": cur["n"],
+                    "prev_key": prev["key"], "partial": partial, "basis": basis})
     return out
 
 
@@ -1004,28 +1101,37 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
         # SVG needs no special handling and simply never fires.
         KEYS = ["total_tokens", "us_tokens"]
         NAMES = [("total_tokens", "全部模型", "s1"), ("us_tokens", "美国模型", "s2")]
-        # min_days guards partial edge buckets: below it, weekday composition
-        # alone drives the mean (a month that has only run to a Saturday reads
-        # structurally light), so the point would be noise dressed as a level.
-        # Both panels share these thresholds — now that they toggle together,
-        # showing different period sets in each would be indefensible.
-        FREQ = [("d", "日频", "日", 1, 2, None, 7),
-                ("w", "周频", "周", 4, 9, None, 4),
-                ("m", "月频", "月", 15, 40, lambda s: s[:7], 3)]
+        # Nothing is dropped for being thin any more. A running period is shown,
+        # and growth_of measures it against the same slice of the previous one,
+        # so the weekday mix cancels instead of being waited out. Both panels
+        # share one bucket set — now that they toggle together, showing
+        # different period sets in each would be indefensible.
+        FREQ = [("d", "日频", "日", 2, None, 7),
+                ("w", "周频", "周", 9, None, 4),
+                ("m", "月频", "月", 40, lambda s: s[:7], 3)]
         lv_charts, lv_tables, lv_notes = [], [], []
         gr_charts, gr_tables, gr_notes = [], [], []
         counts = {}
-        for code, flabel, ulabel, min_days, gapd, xf, win in FREQ:
-            buck = periodise(daily, KEYS, code, min_days)
+        for code, flabel, ulabel, gapd, xf, win in FREQ:
+            buck = periodise(daily, KEYS, code)
             counts[code] = len(buck)
             if not buck:
                 continue
             unit = {"d": "当日", "w": "本周", "m": "本月"}[code]
+            openk = buck[-1]["key"] if not buck[-1]["full"] else None
+            WDAY = "一二三四五六日"
+            opendesc = ""
+            if openk:
+                b = buck[-1]
+                cover = ("周%s~周%s" % (WDAY[min(b["slots"])], WDAY[max(b["slots"])])
+                         if code == "w" else
+                         "%s 日~%s 日" % (min(b["slots"]), max(b["slots"])))
+                opendesc = "进行中：%s，%d 天（%s）" % (b["key"], b["n"], cover)
 
             # ---- level chart
             ser = []
             for key, nm, role in NAMES:
-                pts = [(k, m[key]) for k, m, _t, _n in buck if key in m]
+                pts = [(b["key"], b["means"][key]) for b in buck if key in b["means"]]
                 ser.append({"name": nm, "color_role": role, "points": pts})
             # the mean-based axis cannot show "how much in total this week", and
             # a value-only tipfmt cannot either, so the bucket total and day
@@ -1036,14 +1142,16 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
             ann = None
             if code != "d":
                 ann = {}
-                for k, _m, t, n in buck:
-                    tot = t.get("total_tokens")
+                for b in buck:
+                    tot = b["totals"].get("total_tokens")
                     if tot is not None:
-                        ann[k] = "全站%s合计 %.2fT · %d 天" % (unit, tot / 1e12, n)
+                        ann[b["key"]] = ("全站%s合计 %.2fT · %d 天%s"
+                                         % (unit, tot / 1e12, b["n"],
+                                            "" if b["full"] else " · 进行中，日均受星期构成影响，勿与完整期直接比"))
             lv_charts.append((code, flabel, line_chart(
                 "hist_" + code, ser, "日均 tokens",
                 lambda v: "%.0fT" % (v / 1e12), height=250, zero_base=True,
-                gap_days=gapd, xfmt=xf, annot=ann,
+                gap_days=gapd, xfmt=xf, annot=ann, dashed_from=openk,
                 tipfmt=lambda v: "%.3fT/日" % (v / 1e12))))
 
             hdr = {"d": "日期", "w": "周(周一)", "m": "月份"}[code]
@@ -1052,49 +1160,59 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
                 # those two columns would just repeat themselves
                 lv_tables.append((code, table_of(
                     [hdr, "全部 (T)", "美国 (T)"],
-                    [[k, "%.3f" % ((m.get("total_tokens") or 0) / 1e12),
-                      "%.3f" % ((m.get("us_tokens") or 0) / 1e12)]
-                     for k, m, _t, _n in reversed(buck[-40:])])))
+                    [[b["key"], "%.3f" % ((b["means"].get("total_tokens") or 0) / 1e12),
+                      "%.3f" % ((b["means"].get("us_tokens") or 0) / 1e12)]
+                     for b in reversed(buck[-40:])])))
             else:
                 lv_tables.append((code, table_of(
-                    [hdr, "全部 日均(T)", "美国 日均(T)", "%s合计(T)" % unit, "天数"],
-                    [[k[:7] if code == "m" else k,
-                      "%.3f" % ((m.get("total_tokens") or 0) / 1e12),
-                      "%.3f" % ((m.get("us_tokens") or 0) / 1e12),
-                      "%.2f" % ((t.get("total_tokens") or 0) / 1e12), "%d" % n]
-                     for k, m, t, n in reversed(buck[-40:])])))
-            lv_notes.append((code, {
+                    [hdr, "全部 日均(T)", "美国 日均(T)", "%s合计(T)" % unit, "天数", "状态"],
+                    [[b["key"][:7] if code == "m" else b["key"],
+                      "%.3f" % ((b["means"].get("total_tokens") or 0) / 1e12),
+                      "%.3f" % ((b["means"].get("us_tokens") or 0) / 1e12),
+                      "%.2f" % ((b["totals"].get("total_tokens") or 0) / 1e12),
+                      "%d" % b["n"], "已结束" if b["full"] else "进行中"]
+                     for b in reversed(buck[-40:])])))
+            lv_notes.append((code, escape({
                 "d": "日频保留全部噪声，图中锯齿是周末效应（周末用量结构性低于工作日），不是数据问题。",
                 "w": "按 ISO 周（周一至周日）归集，周末效应被周内平均吸收。",
                 "m": "按自然月归集，最平滑，适合读趋势。",
-            }[code]))
+            }[code] + ("　虚线段＝%s，其日均只是已有那几天的平均，不可与完整期比高低；"
+                       "但下方增速面板对它用的是同口径比较，那个数是可比的。" % opendesc
+                       if openk else ""))))
 
             # ---- growth chart, same buckets
             gr = growth_of(buck, code)
             if len(gr) < 3:
                 continue
-            gv = [g[1] for g in gr]
+            gv = [g["pct"] for g in gr]
             # at daily frequency the day count is always 1 and the comparison
             # period is always yesterday, so spelling both out 575 times is
             # ~25KB of the page saying nothing
             if code == "d":
-                rows_g = [(k[2:], g, "%s · 环比 %+.1f%% · %.3fT" % (k, g, mean / 1e12))
-                          for k, g, mean, _n, _pk in gr]
+                rows_g = [(g["key"][2:], g["pct"],
+                           "%s · 环比 %+.1f%% · %.3fT" % (g["key"], g["pct"], g["mean"] / 1e12))
+                          for g in gr]
             else:
-                rows_g = [(k[2:] if code == "w" else k[2:7], g,
-                           "%s · 环比 %+.1f%% · 日均 %.3fT · %d 天 · 对比 %s"
-                           % (k, g, mean / 1e12, n, pk))
-                          for k, g, mean, n, pk in gr]
+                rows_g = [(g["key"][2:] if code == "w" else g["key"][2:7], g["pct"],
+                           "%s · 环比 %+.1f%% · 日均 %.3fT · %d 天 · 对比 %s%s"
+                           % (g["key"], g["pct"], g["mean"] / 1e12, g["n"], g["prev_key"],
+                              ("　⚠ 进行中，按双方共有的 %d 天同口径比较" % g["basis"])
+                              if g["partial"] else ""))
+                          for g in gr]
             imax, imin = gv.index(max(gv)), gv.index(min(gv))
+            pidx = {i for i, g in enumerate(gr) if g["partial"]}
             gr_charts.append((code, flabel, dbar_chart(
                 "growth_" + code, rows_g, "环比 %",
                 yfmt=lambda v: "%+.0f%%" % v,
-                label_idx={imax, imin, len(rows_g) - 1})))
+                label_idx={imax, imin, len(rows_g) - 1} | pidx,
+                partial_idx=pidx)))
             gr_tables.append((code, table_of(
-                [hdr, "日均 (T)", "天数", "环比", "对比期"],
-                [[k[:7] if code == "m" else k, "%.3f" % (mean / 1e12),
-                  "%d" % n, "%+.1f%%" % g, pk[:7] if code == "m" else pk]
-                 for k, g, mean, n, pk in reversed(gr)])))
+                [hdr, "日均 (T)", "天数", "环比", "对比期", "口径"],
+                [[g["key"][:7] if code == "m" else g["key"], "%.3f" % (g["mean"] / 1e12),
+                  "%d" % g["n"], "%+.1f%%" % g["pct"],
+                  g["prev_key"][:7] if code == "m" else g["prev_key"],
+                  ("同口径 %d 天" % g["basis"]) if g["partial"] else "整期"]
+                 for g in reversed(gr)])))
 
             # Summarising a rate is where this goes wrong quietly. The arithmetic
             # mean of period-over-period percentages is biased upward when the
@@ -1106,7 +1224,11 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
             # So compare LEVELS over three equal windows instead — no averaging
             # of returns, and at daily frequency a 7-day window cancels the
             # weekday effect by construction.
-            lv = [x[1].get("total_tokens") for x in buck]   # bucket means, chronological
+            # The window summary must use SETTLED periods only. A running bucket's
+            # mean is weekday-skewed, and unlike the growth bars there is no
+            # denominator here to cancel it — folding it in would tilt the very
+            # verdict the line exists to give.
+            lv = [b["means"].get("total_tokens") for b in buck if b["full"]]
             summ = ""
             if len(lv) >= 3 * win and all(v is not None for v in lv[-3 * win:]):
                 def wmean(a, b):
@@ -1127,11 +1249,21 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
                     summ = ("近 %d%s vs 前 %d%s %+.1f%%，上一段 %+.1f%%（%s）　"
                             % (win, ulabel, win, ulabel, g1, g0, verdict))
             skipped = len(buck) - 1 - len(gr)
-            gr_notes.append((code, "%s共 %d 个%s环比观测%s%s" % (
+            npart = sum(1 for g in gr if g["partial"])
+            openleft = (buck[-1]["key"] if (not buck[-1]["full"]
+                                            and (not gr or gr[-1]["key"] != buck[-1]["key"]))
+                        else None)
+            gr_notes.append((code, escape("%s共 %d 个%s环比观测%s%s%s%s" % (
                 summ, len(gr), ulabel,
                 ("，%d 处因相邻期缺失未计算" % skipped) if skipped else "",
-                "。日环比被周内构成主导（周六对周五天然是负的），"
-                "极值基本是星期几造成的，不要当成事件。" if code == "d" else "。")))
+                ("。最后 %d 根为进行中的周，用双方共有的星期几同口径比较（空心柱标示）——"
+                 "它可比，但还没走完。" % npart) if npart else "。",
+                ("进行中的 %s 不给环比：月长不是 7 的倍数，按「第几日」对齐并不能对齐星期几"
+                 "（9 月 1~5 日是周二~周六，8 月 1~5 日是周六~周三），"
+                 "算出来的是星期构成差异而不是增速，宁可空着。" % buck[-1]["key"][:7])
+                if openleft else "",
+                "日环比被周内构成主导（周六对周五天然是负的），"
+                "极值基本是星期几造成的，不要当成事件。" if code == "d" else ""))))
 
         def freqbar(note):
             return ('<div class="freqbar" role="group" aria-label="频率口径">'
@@ -1146,15 +1278,15 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
                            for c, body in items)
 
         # a growth multiple off two single days is hostage to which weekday each
-        # landed on; take it off the monthly means instead
-        mb = periodise(daily, ["total_tokens"], "m", 15)
+        # landed on; take it off the monthly means, and only settled ones
+        mb = [b for b in periodise(daily, ["total_tokens"], "m") if b["full"]]
         mult = ""
         if len(mb) >= 2:
-            f0 = mb[0][1].get("total_tokens") or 0
-            l0 = mb[-1][1].get("total_tokens") or 0
+            f0 = mb[0]["means"].get("total_tokens") or 0
+            l0 = mb[-1]["means"].get("total_tokens") or 0
             if f0:
                 mult = ("　月日均 %s→%s 涨 %.0f 倍"
-                        % (mb[0][0][:7], mb[-1][0][:7], l0 / f0))
+                        % (mb[0]["key"][:7], mb[-1]["key"][:7], l0 / f0))
 
         GROUP = ' data-freqgroup="tokens"'
         H.append(panel(
@@ -1172,7 +1304,7 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
             + views(lv_tables),
             note=views(lv_notes),
             pid="history", extra=GROUP,
-            meta=spec(scope=u"每个自然日的全站 token 总量（不是滚动窗口），回补区间 2025-01-01 起。周频按 ISO 周（周一至周日）归集，月频按自然月归集。「美国模型」指 OpenAI / Anthropic / Google / xAI / Meta / Microsoft / Nvidia / Amazon 八家。", calc=u"接口每日返回用量前 50 的模型，外加一行 other 汇总其余全部模型，两者相加即当日完整总量，因此不是「只统计头部」。周频/月频取该桶内各日总量的算术平均即「日均」，而非桶内合计——合计口径会混入三种假信号：自然月天数差异（2 月→3 月仅凭 31/28 就多出 10.7%）、边缘桶未走完（当周/当月总是进行中，合计会塌陷成假暴跌）、以及 2 处缺日各让所在周少掉约 1/7。桶内合计仍在 tooltip 和数据表里给出。", src=u"OpenRouter 官方数据集 v1/datasets/rankings-daily，一次性回补，此后由日常采集接续。", warn=u"周频要求桶内至少 4 天、月频至少 15 天，不足则该桶不画（当周/当月刚开始时，日均会被周内构成主导）。所以最右端可能比日频少一个点，这是有意的。只有「量」能回补——OpenRouter 不提供历史价格，所以价格/支出/VWAP 只能从本看板首次运行起累积，本面板故意不画这三条。日频图中 2 处断点（2025-06-15、2025-07-15）是上游数据集本身的空洞，周频月频下它们被日均口径吸收，不再显示为断点。")))
+            meta=spec(scope=u"每个自然日的全站 token 总量（不是滚动窗口），回补区间 2025-01-01 起。周频按 ISO 周（周一至周日）归集，月频按自然月归集。「美国模型」指 OpenAI / Anthropic / Google / xAI / Meta / Microsoft / Nvidia / Amazon 八家。", calc=u"接口每日返回用量前 50 的模型，外加一行 other 汇总其余全部模型，两者相加即当日完整总量，因此不是「只统计头部」。周频/月频取该桶内各日总量的算术平均即「日均」，而非桶内合计——合计口径会混入三种假信号：自然月天数差异（2 月→3 月仅凭 31/28 就多出 10.7%）、边缘桶未走完（当周/当月总是进行中，合计会塌陷成假暴跌）、以及 2 处缺日各让所在周少掉约 1/7。桶内合计仍在 tooltip 和数据表里给出。", src=u"OpenRouter 官方数据集 v1/datasets/rankings-daily，一次性回补，此后由日常采集接续。", warn=u"最右端可能是一个仍在进行的周/月，画成虚线、空心点。它的日均只是已发生那几天的平均，会被星期构成带偏（周一~周四全是工作日，天然高于含周末的整周），所以不要拿它和左边的完整期比高低——但下方增速面板对它用的是同口径比较（本周已有的星期几 vs 上周同样那几个星期几），那个百分比是可比的。只有「量」能回补——OpenRouter 不提供历史价格，所以价格/支出/VWAP 只能从本看板首次运行起累积，本面板故意不画这三条。日频图中 2 处断点（2025-06-15、2025-07-15）是上游数据集本身的空洞，周频月频下它们被日均口径吸收，不再显示为断点。")))
         H.append('<div class="legend"><span class="sw s1"></span>全部模型'
                  '<span class="sw s2"></span>美国模型'
                  '<span class="lgnote">纵轴＝日均 tokens，三频率同单位</span></div>')
@@ -1186,7 +1318,7 @@ def build(datadir, statedir, outdir, window="week", memory_absolute=False):
                 views(gr_tables),
                 note=views(gr_notes),
                 pid="momgrowth", extra=GROUP,
-                meta=spec(scope=u"上方面板同一批分桶的环比增速，频率随上方联动。日频＝逐日对前一日，周频＝逐周对上周，月频＝逐月对上月。", calc=u"每期先取该期「日均 token 量」＝桶内各日总量的算术平均，再算相邻两期日均之比减一。用日均而非桶内合计是必要的：合计口径的环比会混入自然月天数差异（2 月→3 月仅凭 31/28 就凭空多出 10.7%）与边缘桶未走完的假暴跌。只有当上一期是紧邻的前一期时才计算——跨过数据空洞去比，会得到一个算术正确但标签撒谎的「环比」，那种点直接跳过，留成真实的缺口。", src=u"与上方面板同源，OpenRouter v1/datasets/rankings-daily 回补 + 日常采集接续，不引入任何新数据源。", warn=u"频率越细，噪声越大：日环比几乎完全由星期几决定（周六对周五天然为负），读它的极值没有意义，看周频月频才是趋势。柱高是增速不是量级——增速回落只说明扩张变慢，不代表用量下降，用量本身见上方面板。")))
+                meta=spec(scope=u"上方面板同一批分桶的环比增速，频率随上方联动。日频＝逐日对前一日，周频＝逐周对上周，月频＝逐月对上月。", calc=u"每期先取该期「日均 token 量」＝桶内各日总量的算术平均，再算相邻两期日均之比减一。用日均而非桶内合计是必要的：合计口径的环比会混入自然月天数差异（2 月→3 月仅凭 31/28 就凭空多出 10.7%）与边缘桶未走完的假暴跌。只有当上一期是紧邻的前一期时才计算——跨过数据空洞去比，会得到一个算术正确但标签撒谎的「环比」，那种点直接跳过，留成真实的缺口。进行中的周单独处理：拿它已有的那几个星期几，去比上周同样那几个星期几，而不是比上周整周——否则周一~周四（全工作日）对上一个含周末的整周，比出来的是星期构成差异。", src=u"与上方面板同源，OpenRouter v1/datasets/rankings-daily 回补 + 日常采集接续，不引入任何新数据源。", warn=u"进行中的月份不给环比。月长不是 7 的倍数，按「第几日」对齐并不能对齐星期几——9 月 1~5 日是周二~周六，8 月 1~5 日是周六~周三，硬比会把星期构成差异算成增速（实测差出近一倍），宁可空着。频率越细噪声越大：日环比几乎完全由星期几决定（周六对周五天然为负），读它的极值没有意义，看周频月频才是趋势。柱高是增速不是量级——增速回落只说明扩张变慢，不代表用量下降，用量本身见上方面板。")))
             H.append('<div class="legend"><span class="sw s1"></span>环比正增长'
                      '<span class="sw s2"></span>环比负增长'
                      '<span class="lgnote">柱高＝本期日均相对上期的变化幅度</span></div>')
